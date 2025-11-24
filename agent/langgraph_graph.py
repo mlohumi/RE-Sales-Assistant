@@ -253,27 +253,60 @@ def t2sql_node(state: AgentState) -> AgentState:
     state.candidate_projects = projects
     state.stage = "recommendations"
 
+    # If there are no projects at all (even after soft fallback)
     if not projects:
         msg = (
             "I couldn't find an exact match for your preferences. "
             "I can suggest nearby locations or slightly different budgets if you'd like."
         )
         state.messages.append({"role": "assistant", "content": msg})
+        return state
+
+    # ---------- NEW: detect 'budget too low' case ----------
+    budget_max = state.buyer_profile.budget_max
+    budget_miss = False
+    if budget_max is not None:
+        # Among the returned projects, check if *any* are actually within budget
+        within_budget = [
+            p for p in projects
+            if p.price_usd and p.price_usd <= budget_max
+        ]
+        if not within_budget:
+            budget_miss = True
+
+    lines = []
+
+    if budget_miss:
+        budget_str = f"{budget_max:,.0f} USD"
+        # Acknowledge that nothing fits strictly within budget
+        lines.append(
+            f"I couldn't find any properties that fully match your preferences "
+            f"within your budget of {budget_str}."
+        )
+        lines.append(
+            "However, based on your preferences, here are the closest options "
+            "starting from the lowest price:"
+        )
     else:
-        lines = ["Here are some projects matching your preferences:"]
-        for idx, p in enumerate(projects, start=1):
-            if p.price_usd:
-                price_text = f"{p.price_usd:,.0f} USD"
-            else:
-                price_text = "Price on request"
-            lines.append(
-                f"{idx}. {p.name} in {p.city}, {p.country} – approx. price: {price_text} "
-                f"({p.unit_type or 'unit'})"
-            )
-        lines.append("Would you like to know more about any of these, or book a property visit?")
-        state.messages.append({"role": "assistant", "content": "\n".join(lines)})
+        lines.append("Here are some projects matching your preferences:")
+
+    # List the projects (already sorted by price in the SQL tool)
+    for idx, p in enumerate(projects, start=1):
+        if p.price_usd:
+            price_text = f"{p.price_usd:,.0f} USD"
+        else:
+            price_text = "Price on request"
+
+        lines.append(
+            f"{idx}. {p.name} in {p.city}, {p.country} – approx. price: {price_text} "
+            f"({p.unit_type or 'unit'})"
+        )
+
+    lines.append("Would you like to know more about any of these, or book a property visit?")
+    state.messages.append({"role": "assistant", "content": "\n".join(lines)})
 
     return state
+
 
 
 
@@ -281,23 +314,31 @@ def project_detail_node(state: AgentState) -> AgentState:
     """
     Returns detailed information about a selected project.
 
-    - Tries to infer which project the user means (e.g. "first project", "project 2",
-      or by project name) using LLM.
-    - If still unclear, asks user to choose from the shortlist.
+    Behaviour:
+    - If a project is not yet selected:
+        - Uses LLM to infer which project the user means (index or name)
+        - If still unclear, asks the user to choose explicitly
+    - If a project is selected:
+        - Fetches full details from DB via get_project_details
+        - If not found, optionally falls back to web search
+        - Responds with a nicely formatted, detailed summary
+        - Finally, nudges the user towards booking a property visit
     """
 
-    # Get the last user message
+    # -------------------------------------------
+    # 0) Get the last user message (if any)
+    # -------------------------------------------
     last_user_msg = ""
     for msg in reversed(state.messages):
         if msg.get("role") == "user":
-            last_user_msg = msg.get("content", "")
+            last_user_msg = msg.get("content", "") or ""
             break
 
     # -------------------------------------------
     # 1) Try to infer project choice via LLM if not already selected
     # -------------------------------------------
     if not state.selected_project_id and state.candidate_projects:
-        project_list_text = ""
+        # Build a textual representation of shortlisted projects
         lines = []
         for idx, p in enumerate(state.candidate_projects, start=1):
             lines.append(f"{idx}. {p.name} in {p.city}, {p.country}")
@@ -329,14 +370,20 @@ Rules:
             {"role": "system", "content": system_prompt},
             {
                 "role": "system",
-                "content": f"Shortlisted projects:\n{project_list_text}" if project_list_text else "No shortlisted projects yet."
+                "content": (
+                    f"Shortlisted projects:\n{project_list_text}"
+                    if project_list_text
+                    else "No shortlisted projects yet."
+                ),
             },
             {"role": "user", "content": last_user_msg},
         ]
 
-        extracted = {}
+        extracted: Dict[str, Any] = {}
         try:
-            raw = llm.chat(messages)
+            # llm is the global LLMClient() instance defined at module level
+            raw = llm.chat(messages)  # expected to return a string
+            # Best-effort JSON extraction in case model wraps it in extra text
             start = raw.find("{")
             end = raw.rfind("}")
             if start != -1 and end != -1:
@@ -351,19 +398,21 @@ Rules:
             project_index = extracted.get("project_index")
             project_name = extracted.get("project_name")
 
-            # Try by index first
+            # Try by index first (this is the most reliable when user says "2", "second one" etc.)
             if isinstance(project_index, int):
-                idx0 = project_index - 1
+                idx0 = project_index - 1  # convert 1-based → 0-based index
                 if 0 <= idx0 < len(state.candidate_projects):
                     state.selected_project_id = state.candidate_projects[idx0].id
 
-            # If still None, try fuzzy match by name
+            # If still not resolved, try fuzzy match by name
             if not state.selected_project_id and project_name:
-                pname_lower = project_name.lower()
-                for p in state.candidate_projects:
-                    if p.name.lower() in pname_lower or pname_lower in p.name.lower():
-                        state.selected_project_id = p.id
-                        break
+                pname_lower = str(project_name).lower().strip()
+                if pname_lower:
+                    for p in state.candidate_projects:
+                        pn = p.name.lower()
+                        if pn in pname_lower or pname_lower in pn:
+                            state.selected_project_id = p.id
+                            break
 
     # -------------------------------------------
     # 2) If still no selection, ask user to choose
@@ -373,23 +422,29 @@ Rules:
             lines = ["Which project do you want details for?"]
             for idx, p in enumerate(state.candidate_projects, start=1):
                 lines.append(f"{idx}. {p.name} in {p.city}")
-            state.messages.append({"role": "assistant", "content": "\n".join(lines)})
+            state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": "\n".join(lines),
+                }
+            )
         else:
-            state.messages.append({
-                "role": "assistant",
-                "content": "Which project would you like details about?"
-            })
+            state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": "Which project would you like details about?",
+                }
+            )
         state.stage = "detail_need_selection"
         return state
 
     # -------------------------------------------
     # 3) We have a selected_project_id → fetch details
     # -------------------------------------------
-        details = get_project_details(state.selected_project_id)
+    details = get_project_details(state.selected_project_id)
 
     if not details:
         # Try web search as a fallback for extra information
-        # We only know the selected_project_id, so we need to look it up briefly
         from properties.models import Project
 
         project_name = None
@@ -402,58 +457,80 @@ Rules:
             pass
 
         if project_name:
-            summary = web_search_tool.search_project_info(project_name=project_name, city=city)
+            # Your web_search_tool returns a textual summary
+            summary = web_search_tool.search_project_info(
+                project_name=project_name,
+                city=city,
+            )
         else:
             summary = None
 
         if summary:
-            state.messages.append({
-                "role": "assistant",
-                "content": (
-                    f"I couldn't find structured details for this project in my database, "
-                    f"but here's what I found from external sources about **{project_name}**:\n\n"
-                    f"{summary}"
-                ),
-            })
+            state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        "I couldn't find structured details for this project in my database, "
+                        f"but here's what I found from external sources about **{project_name}**:\n\n"
+                        f"{summary}"
+                    ),
+                }
+            )
             state.stage = "detail_from_web"
         else:
-            state.messages.append({
-                "role": "assistant",
-                "content": (
-                    "I'm unable to find that project's details in my data or through external search. "
-                    "Could you try a different project or ask for general buying guidance?"
-                ),
-            })
+            state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        "I'm unable to find that project's details in my data or through external search. "
+                        "Could you try a different project or ask for general buying guidance?"
+                    ),
+                }
+            )
             state.stage = "detail_error"
 
         return state
 
-
+    # -------------------------------------------
+    # 4) Format and return rich project details + booking nudge (single message)
+    # -------------------------------------------
     lines = [
         f"**{details['name']}** – Full Details:",
         "",
         f"🏙 **Location:** {details['city']}, {details['country']}",
-        f"🏗 **Developer:** {details['developer_name']}" if details["developer_name"] else "",
-        f"🛏 **Bedrooms:** {details['no_of_bedrooms']}" if details["no_of_bedrooms"] is not None else "",
-        f"🛁 **Bathrooms:** {details['bathrooms']}" if details["bathrooms"] is not None else "",
-        f"🏠 **Property Type:** {details['property_type']}" if details["property_type"] else "",
-        f"📐 **Area:** {details['area_sqm']} sq. m." if details["area_sqm"] else "",
-        f"💰 **Price:** {details['price_usd']} USD" if details["price_usd"] else "",
-        f"📅 **Completion Status:** {details['completion_status']}" if details["completion_status"] else "",
-        f"🗓 **Completion Date:** {details['completion_date']}" if details["completion_date"] else "",
+        f"🏗 **Developer:** {details['developer_name']}" if details.get("developer_name") else "",
+        f"🛏 **Bedrooms:** {details['no_of_bedrooms']}" if details.get("no_of_bedrooms") is not None else "",
+        f"🛁 **Bathrooms:** {details['bathrooms']}" if details.get("bathrooms") is not None else "",
+        f"🏠 **Property Type:** {details['property_type']}" if details.get("property_type") else "",
+        f"📐 **Area:** {details['area_sqm']} sq. m." if details.get("area_sqm") else "",
+        f"💰 **Price:** {details['price_usd']} USD" if details.get("price_usd") else "",
+        f"📅 **Completion Status:** {details['completion_status']}" if details.get("completion_status") else "",
+        f"🗓 **Completion Date:** {details['completion_date']}" if details.get("completion_date") else "",
         "",
-        f"✨ **Features:**\n{details['features']}" if details["features"] else "",
+        f"✨ **Features:**\n{details['features']}" if details.get("features") else "",
         "",
-        f"🏢 **Facilities:**\n{details['facilities']}" if details["facilities"] else "",
+        f"🏢 **Facilities:**\n{details['facilities']}" if details.get("facilities") else "",
         "",
-        f"📝 **Description:**\n{details['description']}" if details["description"] else "",
+        f"📝 **Description:**\n{details['description']}" if details.get("description") else "",
     ]
 
-    result = "\n".join([line for line in lines if line.strip()])
+    detail_text = "\n".join(line for line in lines if line.strip())
 
-    state.messages.append({"role": "assistant", "content": result})
+    booking_nudge = (
+        f"\n\nIf this looks interesting, I can help you schedule a property viewing "
+        f"for **{details['name']}**.\n"
+        "Would you like to book a visit?"
+    )
+
+    full_reply = detail_text + booking_nudge
+
+    # SINGLE assistant message so API returns both details + nudge
+    state.messages.append({"role": "assistant", "content": full_reply})
     state.stage = "detail_complete"
     return state
+
+
+
 
 
 
